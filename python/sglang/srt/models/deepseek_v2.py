@@ -3387,7 +3387,12 @@ class DeepseekV2ForCausalLM(nn.Module):
             ]:
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn=False,
+        extra_params_mapping=None,
+    ):
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -3414,6 +3419,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+
+        if extra_params_mapping is not None:
+            stacked_params_mapping.extend(extra_params_mapping)
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
