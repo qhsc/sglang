@@ -38,6 +38,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
+  m.def(
+      "all_gather(int fa, Tensor inp, Tensor! out, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  m.impl("all_gather", torch::kCUDA, &all_gather);
+
+  m.def(
+      "reduce_scatter(int fa, Tensor inp, Tensor! out, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  m.impl("reduce_scatter", torch::kCUDA, &reduce_scatter);
+
   m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
   m.def(
       "mscclpp_init_context(Tensor unique_id, int rank, int world_size, Tensor scratch, Tensor put_buffer, "

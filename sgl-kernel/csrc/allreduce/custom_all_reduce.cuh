@@ -200,7 +200,13 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
-template <typename T, int ngpus>
+enum class CommOpType {
+  ALL_REDUCE,
+  REDUCE_SCATTER,
+  ALL_GATHER,
+};
+
+template <typename T, int ngpus, CommOpType _>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
   using P = typename packed_t<T>::P;
@@ -221,7 +227,7 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
-template <typename T, int ngpus>
+template <typename T, int ngpus, CommOpType op_type = CommOpType::ALL_REDUCE>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -233,34 +239,47 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
   int end = rank == ngpus - 1 ? size : start + part;
   int largest_part = part + size % ngpus;
   const P* ptrs[ngpus];
-  P* tmps[ngpus];
+  P* tmps[ngpus] = {};
 #pragma unroll
   for (int i = 0; i < ngpus; i++) {
     int target = (rank + i) % ngpus;
     ptrs[i] = (const P*)_dp->ptrs[target];
-    tmps[i] = get_tmp_buf<P>(sg.signals[target]);
+    if constexpr (op_type == CommOpType::ALL_REDUCE) {
+      tmps[i] = get_tmp_buf<P>(sg.signals[target]);
+    }
   }
-  auto tmp_out = tmps[0];
+
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+
   // stage 1: reduce scatter
-  for (int idx = start + tid; idx < end; idx += stride) {
-    tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
+  if constexpr (op_type == CommOpType::ALL_REDUCE || op_type == CommOpType::REDUCE_SCATTER) {
+    auto tmp_out = op_type == CommOpType::ALL_REDUCE ? tmps[0] : (P*)result;
+    for (int idx = start + tid; idx < end; idx += stride) {
+      tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
+    }
+    multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
   }
-  multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
 
   // stage 2: allgather. Note: it's important to match the tid between
   // the two stages, because visibility across devices is only guaranteed
   // between threads that have the same tid. If thread i computes the sum of
   // start + i in the first stage, then thread i also gathers start + i from all
   // ranks.
-  for (int idx = tid; idx < largest_part; idx += stride) {
+  if constexpr (op_type == CommOpType::ALL_REDUCE || op_type == CommOpType::ALL_GATHER) {
+    const P** source = op_type == CommOpType::ALL_REDUCE ? tmps : ptrs;
+    for (int idx = tid; idx < largest_part; idx += stride) {
 #pragma unroll
-    for (int i = 0; i < ngpus; i++) {
-      int gather_from_rank = ((rank + i) % ngpus);
-      if (gather_from_rank == ngpus - 1 || idx < part) {
-        int dst_idx = gather_from_rank * part + idx;
-        ((P*)result)[dst_idx] = tmps[i][idx];
+      for (int i = 0; i < ngpus; i++) {
+        int gather_from_rank = ((rank + i) % ngpus);
+        if (gather_from_rank == ngpus - 1 || idx < part) {
+          int dst_idx = gather_from_rank * part + idx;
+          ((P*)result)[dst_idx] = source[i][idx];
+        }
       }
+    }
+
+    if constexpr (op_type == CommOpType::ALL_GATHER) {
+      multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
     }
   }
 }
@@ -405,7 +424,7 @@ class CustomAllreduce {
   }
 
   /**
-   * Performs allreduce, assuming input has already been registered.
+   * Performs allreduce/reduce scatter/allgather operation, assuming input has already been registered.
    *
    * Block and grid default configs are results after careful grid search. Using
    * 36 blocks give the best or close to the best runtime on the devices I
@@ -413,12 +432,12 @@ class CustomAllreduce {
    * take a small amount of SMs. Not quite sure the underlying reason, but my
    * guess is that too many SMs will cause contention on NVLink bus.
    */
-  template <typename T>
-  void allreduce(cudaStream_t stream, T* input, T* output, int size, int threads = 512, int block_limit = 36) {
+  template <typename T, CommOpType op_type = CommOpType::ALL_REDUCE>
+  void collective_comm(cudaStream_t stream, T* input, T* output, int size, int threads = 512, int block_limit = 36) {
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
-          "custom allreduce currently requires input length to be multiple "
+          "custom collective_comm currently requires input length to be multiple "
           "of " +
           std::to_string(d));
     if (block_limit > kMaxBlocks)
@@ -442,12 +461,15 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
-#define KL(ngpus, name) name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+#define KL(ngpus, name) \
+  name<T, ngpus, op_type><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
     // TODO(hanzhi713): Threshold is different for A100 and H100.
     // Add per device threshold.
 #define REDUCE_CASE(ngpus)                                                                        \
   case ngpus: {                                                                                   \
-    if (world_size_ == 2) {                                                                       \
+    if (op_type != CommOpType::ALL_REDUCE) {                                                      \
+      KL(ngpus, cross_device_reduce_2stage);                                                      \
+    } else if (world_size_ == 2) {                                                                \
       KL(ngpus, cross_device_reduce_1stage);                                                      \
     } else if (full_nvlink_) {                                                                    \
       if ((world_size_ <= 4 && bytes < 512 * 1024) || (world_size_ <= 8 && bytes < 256 * 1024)) { \

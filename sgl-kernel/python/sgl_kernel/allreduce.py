@@ -125,6 +125,28 @@ else:
             fa, inp, out, reg_buffer, reg_buffer_sz_bytes
         )
 
+    def all_gather(
+        fa: int,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        reg_buffer: int,
+        reg_buffer_sz_bytes: int,
+    ) -> None:
+        torch.ops.sgl_kernel.all_gather.default(
+            fa, inp, out, reg_buffer, reg_buffer_sz_bytes
+        )
+
+    def reduce_scatter(
+        fa: int,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        reg_buffer: int,
+        reg_buffer_sz_bytes: int,
+    ) -> None:
+        torch.ops.sgl_kernel.reduce_scatter.default(
+            fa, inp, out, reg_buffer, reg_buffer_sz_bytes
+        )
+
     def get_graph_buffer_ipc_meta(fa) -> Tuple[List[int], List[int]]:
         return torch.ops.sgl_kernel.get_graph_buffer_ipc_meta.default(fa)
 
