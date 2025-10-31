@@ -287,7 +287,6 @@ def initialize_dp_attention(
         use_npu_communicator=False,
         group_name="attention_tp",
     )
-    print(f"!!! _ATTN_TP_GROUP: {_ATTN_TP_GROUP.ca_comm.disabled} !!!")
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,

@@ -66,6 +66,26 @@ if not is_hip() and not is_npu():
     ) -> None:
         custom_op.register_graph_buffers(fa, handles, offsets)
 
+    if hasattr(custom_op, "reduce_scatter"):
+
+        def reduce_scatter(
+            fa: int,
+            inp: torch.Tensor,
+            out: torch.Tensor,
+            reg_buffer: int,
+            reg_buffer_sz_bytes: int,
+        ) -> None:
+            custom_op.reduce_scatter(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
+
+        def all_gather(
+            fa: int,
+            inp: torch.Tensor,
+            out: torch.Tensor,
+            reg_buffer: int,
+            reg_buffer_sz_bytes: int,
+        ) -> None:
+            custom_op.all_gather(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
+
 else:
     # ROCM custom allreduce
 

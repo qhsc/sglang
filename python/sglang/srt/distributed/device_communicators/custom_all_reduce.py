@@ -330,7 +330,7 @@ class CustomAllreduce:
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
-        if inp_size % 16 != 0:
+        if inp_size % 16 != 0 or inp_size == 0:
             return False
         if not is_weak_contiguous(inp):
             return False
