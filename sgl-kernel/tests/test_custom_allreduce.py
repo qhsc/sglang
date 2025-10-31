@@ -42,17 +42,41 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes)
         for sz in test_sizes:
             for dtype in [torch.float32, torch.float16, torch.bfloat16]:
                 for _ in range(test_loop):
+                    # test all reduce
                     inp1 = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
                     inp1_ref = inp1.clone()
                     out1 = torch.empty_like(inp1)
-
                     custom_ops.all_reduce(
                         custom_ptr, inp1, out1, buffer_ptrs[rank], max_size
                     )
-
                     dist.all_reduce(inp1_ref, group=group)
-
                     torch.testing.assert_close(out1, inp1_ref)
+
+                    # test reduce scatter
+                    inp2 = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
+                    out2 = torch.empty((sz // world_size,), dtype=dtype, device=device)
+                    out2_ref = torch.empty_like(out2)
+                    custom_ops.reduce_scatter(
+                        custom_ptr, inp2, out2, buffer_ptrs[rank], max_size
+                    )
+                    dist.reduce_scatter_tensor(output=out2_ref, input=inp2, group=group)
+                    torch.testing.assert_close(out2, out2_ref)
+
+                    # test all gather
+                    inp3 = torch.randint(
+                        1, 16, (sz // world_size,), dtype=dtype, device=device
+                    )
+                    out3 = torch.empty(
+                        (inp3.shape[0] * world_size,), dtype=dtype, device=device
+                    )
+                    out3_ref = torch.empty_like(out3)
+                    custom_ops.all_gather(
+                        custom_ptr, inp3, out3, buffer_ptrs[rank], max_size
+                    )
+                    dist.all_gather_into_tensor(
+                        output_tensor=out3_ref, input_tensor=inp3, group=group
+                    )
+                    torch.testing.assert_close(out3, out3_ref)
 
     finally:
         dist.barrier(group=group)

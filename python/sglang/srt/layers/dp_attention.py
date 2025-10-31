@@ -39,6 +39,7 @@ _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_DP_ATTN_USE_CUSTOM_ALLREDUCE = get_bool_env_var("SGLANG_DP_ATTN_USE_CUSTOM_ALLREDUCE")
 
 
 class DpPaddingMode(IntEnum):
@@ -279,13 +280,14 @@ def initialize_dp_attention(
         torch.distributed.get_backend(tp_group.device_group),
         use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
         use_pymscclpp=False,
-        use_custom_allreduce=False,
+        use_custom_allreduce=_DP_ATTN_USE_CUSTOM_ALLREDUCE,
         use_torch_symm_mem=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
         group_name="attention_tp",
     )
+    print(f"!!! _ATTN_TP_GROUP: {_ATTN_TP_GROUP.ca_comm.disabled} !!!")
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,

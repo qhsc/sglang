@@ -187,6 +187,27 @@ if _supports_custom_op:
         fake_impl=reg_all_gather_into_tensor_fake,
     )
 
+    def reg_reduce_scatter_tensor(
+        output: torch.Tensor, input: torch.Tensor, group_name: str
+    ) -> None:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        group._reduce_scatter_tensor(output, input)
+
+    def reg_reduce_scatter_tensor_fake(
+        output: torch.Tensor, input: torch.Tensor, group_name: str
+    ) -> None:
+        pass
+
+    direct_register_custom_op(
+        op_name="reg_reduce_scatter_tensor",
+        op_func=reg_reduce_scatter_tensor,
+        mutates_args=["output"],
+        fake_impl=reg_reduce_scatter_tensor_fake,
+    )
+
 
 class GroupCoordinator:
     """
@@ -628,13 +649,33 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
+    def _reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        print(
+            f"!!! _reduce_scatter_tensor: {self.ca_comm.should_custom_reduce_scatter_tensor(input)} !!!"
+        )
+        if (
+            self.ca_comm is not None
+            and self.ca_comm.should_custom_reduce_scatter_tensor(input)
+        ):
+            print(f"!!! custom reduce scatter tensor !!!")
+            self.ca_comm.custom_reduce_scatter_tensor(input, output)
+        else:
+            torch.distributed.reduce_scatter_tensor(
+                output, input, group=self.device_group
+            )
+
     def reduce_scatter_tensor(
         self,
         output: torch.Tensor,
         input: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         # TODO(ch-wan): support other backends
-        torch.distributed.reduce_scatter_tensor(output, input, group=self.device_group)
+        if _is_npu or _is_xpu or not _supports_custom_op:
+            self._reduce_scatter_tensor(output, input)
+        else:
+            torch.ops.sglang.reg_reduce_scatter_tensor(
+                output, input, group_name=self.unique_name
+            )
         return output
 
     def reduce_scatter(
@@ -682,8 +723,12 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        ca_comm = self.ca_comm
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        if ca_comm is not None and ca_comm.should_custom_all_gather_tensor(input):
+            print(f"!!! custom all gather tensor !!!")
+            ca_comm.custom_all_gather_tensor(input, output)
+        elif pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_gather(output, input)
         else:
             torch.distributed.all_gather_into_tensor(

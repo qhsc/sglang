@@ -411,6 +411,74 @@ class CustomAllreduce:
             else:
                 return self.all_reduce(input, registered=False)
 
+    def reduce_scatter_tensor(
+        self, input: torch.Tensor, output: torch.Tensor, registered: bool = False
+    ):
+        if registered:
+            ops.reduce_scatter(self._ptr, input, output, 0, 0)
+        else:
+            ops.reduce_scatter(
+                self._ptr, input, output, self.buffer_ptrs[self.rank], self.max_size
+            )
+
+    def should_custom_reduce_scatter_tensor(self, input: torch.Tensor) -> bool:
+        return (
+            _is_cuda and self.should_custom_ar(input) and hasattr(ops, "reduce_scatter")
+        )
+
+    def custom_reduce_scatter_tensor(
+        self, input: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        if not self.should_custom_reduce_scatter_tensor(input):
+            logger.warning(
+                "Custom reduce scatter tensor not supported for some reason. "
+                "This function should not be called."
+            )
+            return
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                self.reduce_scatter_tensor(
+                    input, output, registered=not self.tms_cudagraph
+                )
+            else:
+                return
+        else:
+            self.reduce_scatter_tensor(input, output, registered=False)
+
+    def all_gather_tensor(
+        self, input: torch.Tensor, output: torch.Tensor, registered: bool = False
+    ):
+        if registered:
+            ops.all_gather(self._ptr, input, output, 0, 0)
+        else:
+            ops.all_gather(
+                self._ptr, input, output, self.buffer_ptrs[self.rank], self.max_size
+            )
+
+    def should_custom_all_gather_tensor(self, input: torch.Tensor) -> bool:
+        return (
+            self.should_custom_reduce_scatter_tensor(input)
+            and (input.numel() * input.element_size() * self.world_size)
+            <= self.max_size
+        )
+
+    def custom_all_gather_tensor(
+        self, input: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        if not self.should_custom_all_gather_tensor(input):
+            logger.warning(
+                "Custom all gather tensor not supported for some reason. "
+                "This function should not be called."
+            )
+            return
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                self.all_gather_tensor(input, output, registered=not self.tms_cudagraph)
+            else:
+                return
+        else:
+            self.all_gather_tensor(input, output, registered=False)
+
     def close(self):
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)
