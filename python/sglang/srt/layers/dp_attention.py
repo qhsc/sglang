@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -332,6 +332,17 @@ def get_local_attention_dp_rank() -> int:
 def get_local_attention_dp_size() -> int:
     assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
     return _LOCAL_ATTN_DP_SIZE
+
+
+@contextmanager
+def attn_tp_graph_capture(stream: Optional[torch.cuda.Stream] = None):
+    global _ATTN_TP_GROUP
+    if _ATTN_TP_GROUP is None:
+        with nullcontext():
+            yield
+    else:
+        with _ATTN_TP_GROUP.graph_capture(stream=stream) as context:
+            yield context
 
 
 @contextmanager

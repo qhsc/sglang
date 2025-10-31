@@ -443,6 +443,8 @@ class CustomAllreduce:
             else:
                 return
         else:
+            # In this state, current stream can NOT be capturing. Otherwise, illeagle memory access will occur.
+            assert not torch.cuda.is_current_stream_capturing()
             self.reduce_scatter_tensor(input, output, registered=False)
 
     def all_gather_tensor(
@@ -477,6 +479,7 @@ class CustomAllreduce:
             else:
                 return
         else:
+            assert not torch.cuda.is_current_stream_capturing()
             self.all_gather_tensor(input, output, registered=False)
 
     def close(self):
