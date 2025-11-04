@@ -2,12 +2,9 @@ from typing import Any, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -15,8 +12,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -95,7 +90,7 @@ class DotsDecoderLayer(DeepseekV2DecoderLayer):
         )
 
         if self.is_layer_sparse:
-            self.mlp = DotsMoE(
+            self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
@@ -250,145 +245,6 @@ class DotsDecoderLayer(DeepseekV2DecoderLayer):
             )
 
         return hidden_states, residual
-
-
-class DotsMoE(DeepseekV2MoE):
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
-        is_nextn: bool = False,
-    ):
-        super().__init__(
-            config=config,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=prefix,
-            alt_stream=alt_stream,
-            is_nextn=is_nextn,
-        )
-        self.rest_sms = None
-
-    def get_rest_sms(self):
-        if self.rest_sms is None:
-            num_sms = torch.cuda.get_device_properties(
-                device="cuda"
-            ).multi_processor_count
-            self.rest_sms = num_sms - DeepEPConfig.get_instance().num_sms
-        return self.rest_sms
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
-        if not self._enable_a2a_moe:
-            DUAL_STREAM_TOKEN_THRESHOLD = 1024
-            if (
-                self.alt_stream is not None
-                and self.num_fused_shared_experts == 0
-                and hidden_states.shape[0] > 0
-                and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
-            ):
-                return self.forward_normal_dual_stream(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
-                )
-            else:
-                return self.forward_normal(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
-                )
-        else:
-            if self.alt_stream is not None and not forward_batch.can_run_tbo:
-                return self.forward_deepep_dual_stream(hidden_states, forward_batch)
-            return self.forward_deepep(hidden_states, forward_batch)
-
-    def shared_expert_overlap(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        shared_output = None
-        current_stream = torch.cuda.current_stream()
-        self.experts.deepep_dispatcher.dispatch_a(
-            hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            forward_batch=forward_batch,
-        )
-
-        if hidden_states.shape[0] > 0:
-            if self.alt_stream is not None:
-                self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    if forward_batch.forward_mode.is_extend():
-                        with deep_gemm_wrapper.configure_deep_gemm_num_sms(
-                            self.get_rest_sms()
-                        ):
-                            shared_output = self._forward_shared_experts(hidden_states)
-                    else:
-                        shared_output = self._forward_shared_experts(hidden_states)
-            else:
-                shared_output = self._forward_shared_experts(hidden_states)
-
-        dispatch_output = self.experts.deepep_dispatcher.dispatch_b()
-        final_hidden_states = self.experts.moe_impl(dispatch_output)
-        final_hidden_states = self.experts.combine(
-            final_hidden_states,
-            dispatch_output.topk_idx,
-            dispatch_output.topk_weights,
-            forward_batch,
-        )
-        return shared_output, final_hidden_states
-
-    def forward_deepep_dual_stream(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        current_stream = torch.cuda.current_stream()
-
-        if hidden_states.shape[0] > 0:
-            router_logits = self.gate(hidden_states)
-            topk_weights, topk_idx, _ = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
-            )
-        else:
-            topk_weights, topk_idx, _ = self.topk.empty_topk_output(
-                hidden_states.device
-            )
-
-        shared_output, final_hidden_states = self.shared_expert_overlap(
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            forward_batch,
-        )
-
-        if shared_output is not None:
-            if self.alt_stream is not None:
-                current_stream.wait_stream(self.alt_stream)
-            x = shared_output
-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        else:
-            final_hidden_states *= self.routed_scaling_factor
-
-        return final_hidden_states
 
 
 class DotsModel(DeepseekV2Model):
